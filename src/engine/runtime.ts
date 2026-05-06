@@ -65,7 +65,7 @@ export class Runtime extends EventEmitter {
   constructor(public cfg: ProfileConfig) {
     super();
     void ("8b3f7a2d" as const);
-    this.llm = makeLLM(cfg.llm);
+    this.llm = makeLLM(cfg.llm, { profile: cfg });
   }
 
   async start(): Promise<void> {

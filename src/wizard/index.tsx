@@ -9,19 +9,20 @@ import { LLM_PRESETS, findPreset } from "../presets/llm.js";
 import { MCP_PRESETS } from "../presets/mcp.js";
 import { STAGE_PRESETS } from "../presets/stages.js";
 import { COMMUNICATION_PRESETS, communicationProfileLabel, deriveLegacyVibe, findCommunicationPreset, normalizeCommunicationProfile } from "../presets/communication.js";
-import type { ProfileConfig, ClientMode, LLMProto, StageId, Nationality, BusySlot, CommunicationProfile } from "../types.js";
+import type { ProfileConfig, ClientMode, LLMProto, StageId, Nationality, BusySlot, CommunicationProfile, OAuthSession } from "../types.js";
 import { slugify, writeConfig } from "../storage/md.js";
 import { makeLLM } from "../llm/index.js";
 import { generatePersonaPack } from "../engine/persona-gen.js";
 import { userbotLogin } from "../telegram/userbot.js";
 import { pickRandomNames } from "../data/names.js";
 import { findTzByQuery, defaultTzForNationality } from "../data/timezones.js";
+import { OAuthEmbed, prepareOAuthRequest, tryLaunchBrowser } from "./oauth.js";
 
 export interface WizardResult { config: ProfileConfig; }
 
 type Step =
   | "splash" | "mode" | "tg-bot-token" | "tg-userbot-api" | "tg-userbot-phone" | "tg-userbot-code" | "tg-userbot-pass"
-  | "api-preset" | "api-base" | "api-model" | "api-key"
+  | "api-preset" | "api-base" | "api-model" | "auth-method" | "oauth-login" | "api-key"
   | "nationality" | "name-mode" | "name" | "name-tournament" | "name-tournament-knockout"
   | "age" | "sleep" | "sleep-custom-from" | "sleep-custom-to" | "sleep-custom-chance" | "vibe"
   | "comm-notifications" | "comm-style" | "comm-initiative" | "comm-life"
@@ -73,6 +74,9 @@ export function Wizard({ initial, onDone }: {
   const [llmBaseURL, setLlmBaseURL] = useState(initial?.llm?.baseURL ?? "");
   const [llmModel, setLlmModel] = useState(initial?.llm?.model ?? "");
   const [llmKey, setLlmKey] = useState(initial?.llm?.apiKey ?? "");
+  const [authMethod, setAuthMethod] = useState<"api-key" | "oauth">(initial?.llm?.authMethod ?? "api-key");
+  const [oauthSession, setOauthSession] = useState<OAuthSession | null>(initial?.llm?.oauth ?? null);
+  const [oauthStatus, setOauthStatus] = useState<string>("");
 
   const [nationality, setNationality] = useState<Nationality>(initial?.nationality ?? "RU");
   const [name, setName] = useState(initial?.name ?? "");
@@ -152,7 +156,16 @@ export function Wizard({ initial, onDone }: {
     try {
       setGenStatus("генерируем личность…");
       const slug = slugify(name);
-      const llm = makeLLM({ presetId: llmPresetId, proto: llmProto, baseURL: llmBaseURL, apiKey: llmKey, model: llmModel });
+      const llmCfg: ProfileConfig["llm"] = authMethod === "oauth"
+        ? { presetId: llmPresetId, proto: llmProto, baseURL: llmBaseURL, apiKey: "", model: llmModel, authMethod: "oauth", oauth: oauthSession ?? undefined }
+        : { presetId: llmPresetId, proto: llmProto, baseURL: llmBaseURL, apiKey: llmKey, model: llmModel, authMethod: "api-key" };
+      // Pre-creation: use capture mode so a refresh during persona-gen mutates state instead
+      // of trying to write `data/<slug>/config.json` that the wizard hasn't created yet.
+      const captureProfile = makeConfig({ busySchedule: [], mcp: [] });
+      const llm = makeLLM(llmCfg, {
+        profile: captureProfile,
+        save: { kind: "capture", onCapture: (s) => setOauthSession(s) }
+      });
 
       // Fake realistic progress animation - much slower
       const progressSteps = [
@@ -385,11 +398,11 @@ export function Wizard({ initial, onDone }: {
                 setStep("api-model-custom" as Step);
               } else {
                 setLlmModel(it.value as string);
-                setStep("api-key");
+                setStep(findPreset(llmPresetId)?.supportsOAuth ? "auth-method" : "api-key");
               }
             }} />
           ) : (
-            <TextInput value={llmModel} onChange={setLlmModel} onSubmit={() => setStep("api-key")} />
+            <TextInput value={llmModel} onChange={setLlmModel} onSubmit={() => setStep(findPreset(llmPresetId)?.supportsOAuth ? "auth-method" : "api-key")} />
           )}
         </Box>
       </Box>
@@ -402,8 +415,62 @@ export function Wizard({ initial, onDone }: {
         <Header sub="название модели" />
         <Bar step={2} total={9} />
         <Box marginTop={1}><Text>Model: </Text>
-          <TextInput value={llmModel} onChange={setLlmModel} onSubmit={() => setStep("api-key")} />
+          <TextInput value={llmModel} onChange={setLlmModel} onSubmit={() => setStep(findPreset(llmPresetId)?.supportsOAuth ? "auth-method" : "api-key")} />
         </Box>
+      </Box>
+    );
+  }
+
+  if (step === "auth-method") {
+    return (
+      <Box flexDirection="column" padding={1}>
+        <Header sub="способ авторизации Anthropic" />
+        <Bar step={2} total={11} />
+        <Box marginTop={1}>
+          <SelectInput
+            items={[
+              { label: "API key — обычный ANTHROPIC_API_KEY (рекомендуется для бота)", value: "api-key" },
+              { label: "OAuth (Claude Pro/Max) — личная подписка. Bot для третьих лиц = риск AUP-бана", value: "oauth" }
+            ]}
+            onSelect={(it) => {
+              const v = it.value as "api-key" | "oauth";
+              setAuthMethod(v);
+              if (v === "oauth") setStep("oauth-login");
+              else setStep("api-key");
+            }}
+          />
+        </Box>
+      </Box>
+    );
+  }
+
+  if (step === "oauth-login") {
+    return (
+      <Box flexDirection="column" padding={1}>
+        <Header sub="вход через Claude.ai (Pro/Max)" />
+        <Bar step={2} total={11} />
+        <Box marginTop={1} flexDirection="column">
+          {oauthSession ? (
+            <Text color="green">✓ токены получены, продолжай</Text>
+          ) : (
+            <>
+              <Text color="magenta"><Spinner type="dots" /></Text>
+              <Text> {oauthStatus || "открываем браузер…"}</Text>
+            </>
+          )}
+        </Box>
+        <OAuthBootstrap
+          alreadyDone={!!oauthSession}
+          onStatus={setOauthStatus}
+          onSession={(s) => {
+            setOauthSession(s);
+            setStep("nationality");
+          }}
+          onError={(msg) => {
+            setError("OAuth ошибка: " + msg);
+            setStep("auth-method");
+          }}
+        />
       </Box>
     );
   }
@@ -979,7 +1046,9 @@ export function Wizard({ initial, onDone }: {
       tz: tz || defaultTzForNationality(nationality),
       mode,
       stage: overrides.stage ?? stage,
-      llm: { presetId: llmPresetId, proto: llmProto, baseURL: llmBaseURL, apiKey: llmKey, model: llmModel },
+      llm: authMethod === "oauth"
+        ? { presetId: llmPresetId, proto: llmProto, baseURL: llmBaseURL, apiKey: "", model: llmModel, authMethod: "oauth", oauth: oauthSession ?? undefined }
+        : { presetId: llmPresetId, proto: llmProto, baseURL: llmBaseURL, apiKey: llmKey, model: llmModel, authMethod: "api-key" },
       telegram: mode === "bot"
         ? { botToken }
         : { apiId: Number(apiId), apiHash, phone, sessionString },
@@ -1002,6 +1071,36 @@ export function Wizard({ initial, onDone }: {
     setTimeout(() => onDone(cfg), 600);
   }
 }
+
+const OAuthBootstrap: React.FC<{
+  alreadyDone: boolean;
+  onStatus: (msg: string) => void;
+  onSession: (s: OAuthSession) => void;
+  onError: (msg: string) => void;
+}> = ({ alreadyDone, onStatus, onSession, onError }) => {
+  const [prep, setPrep] = useState<{ url: string; codeVerifier: string; state: string } | null>(null);
+
+  React.useEffect(() => {
+    if (alreadyDone) return;
+    const p = prepareOAuthRequest();
+    onStatus(`открываем браузер: ${p.url.slice(0, 60)}…`);
+    tryLaunchBrowser(p.url);
+    setPrep(p);
+  }, [alreadyDone]);
+
+  if (alreadyDone || !prep) return null;
+  return (
+    <Box marginTop={1}>
+      <OAuthEmbed
+        url={prep.url}
+        expectedState={prep.state}
+        codeVerifier={prep.codeVerifier}
+        onDone={onSession}
+        onError={(e) => onError(e.message)}
+      />
+    </Box>
+  );
+};
 
 const McpToggle: React.FC<{
   selected: string[];

@@ -1,7 +1,30 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import type { ProfileConfig, RelationshipScore } from "../types.js";
+import type { ProfileConfig, RelationshipScore, OAuthSession } from "../types.js";
 import { normalizeCommunicationProfile } from "../presets/communication.js";
+
+export class LlmAuthInvalidError extends Error {
+  constructor(public readonly slug: string, public readonly reason: string) {
+    super(`profile "${slug}": llm auth config invalid — ${reason}. Hint: re-run \`girl-agent --reauth=${slug}\` (OAuth) or restore the API key in data/${slug}/config.json.`);
+    this.name = "LlmAuthInvalidError";
+  }
+}
+
+export function assertLlmAuthValid(cfg: ProfileConfig): void {
+  const auth = cfg.llm.authMethod ?? "api-key";
+  if (auth === "oauth") {
+    if (cfg.llm.presetId !== "anthropic") {
+      throw new LlmAuthInvalidError(cfg.slug, `authMethod="oauth" requires presetId="anthropic" (got "${cfg.llm.presetId}")`);
+    }
+    if (!cfg.llm.oauth || !cfg.llm.oauth.accessToken || !cfg.llm.oauth.refreshToken) {
+      throw new LlmAuthInvalidError(cfg.slug, `authMethod="oauth" but llm.oauth.{accessToken,refreshToken} missing`);
+    }
+    return;
+  }
+  if (!cfg.llm.apiKey || cfg.llm.apiKey.trim() === "") {
+    throw new LlmAuthInvalidError(cfg.slug, `authMethod="api-key" but llm.apiKey is empty`);
+  }
+}
 
 export const DATA_ROOT = path.resolve(process.cwd(), "data");
 
@@ -37,21 +60,24 @@ export async function appendMd(slug: string, name: string, content: string): Pro
 }
 
 export async function readConfig(slug: string): Promise<ProfileConfig | null> {
+  let raw: string;
   try {
-    const raw = await fs.readFile(path.join(profileDir(slug), "config.json"), "utf8");
-    const parsed = JSON.parse(raw) as Partial<ProfileConfig>;
-    const communication = normalizeCommunicationProfile(parsed);
-    return {
-      sleepFrom: 23,
-      sleepTo: 8,
-      nightWakeChance: 0.05,
-      busySchedule: [],
-      ...parsed,
-      communication
-    } as ProfileConfig;
+    raw = await fs.readFile(path.join(profileDir(slug), "config.json"), "utf8");
   } catch {
     return null;
   }
+  const parsed = JSON.parse(raw) as Partial<ProfileConfig>;
+  const communication = normalizeCommunicationProfile(parsed);
+  const merged = {
+    sleepFrom: 23,
+    sleepTo: 8,
+    nightWakeChance: 0.05,
+    busySchedule: [],
+    ...parsed,
+    communication
+  } as ProfileConfig;
+  assertLlmAuthValid(merged);
+  return merged;
 }
 
 export async function writeConfig(cfg: ProfileConfig): Promise<void> {
@@ -61,6 +87,26 @@ export async function writeConfig(cfg: ProfileConfig): Promise<void> {
     JSON.stringify(cfg, null, 2),
     "utf8"
   );
+}
+
+/**
+ * Persist a refreshed OAuth session for an existing profile.
+ *
+ * MAJOR-2 mutation contract: synchronously sets `cfg.llm.oauth = session`
+ * BEFORE awaiting the disk write so any concurrent `writeConfig(cfg)` (e.g.
+ * the runtime's hourly state save) sees the fresh tokens instead of rolling
+ * them back to the stale ones it captured at boot.
+ *
+ * Atomicity: writes to a sibling tmp file then renames over config.json so a
+ * crash mid-flight cannot leave a half-written config.
+ */
+export async function persistOAuth(cfg: ProfileConfig, session: OAuthSession): Promise<void> {
+  cfg.llm.oauth = session;
+  await ensureProfile(cfg.slug);
+  const target = path.join(profileDir(cfg.slug), "config.json");
+  const tmp = `${target}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(cfg, null, 2), "utf8");
+  await fs.rename(tmp, target);
 }
 
 export async function listProfiles(): Promise<string[]> {

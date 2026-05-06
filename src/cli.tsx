@@ -11,6 +11,7 @@ import { makeLLM } from "./llm/index.js";
 import { parseTzFlag, defaultTzForNationality } from "./data/timezones.js";
 import { pickRandomNames } from "./data/names.js";
 import { communicationProfileLabel, deriveLegacyVibe, findCommunicationPreset, normalizeCommunicationProfile } from "./presets/communication.js";
+import { runOAuthFlow } from "./wizard/oauth.js";
 import type { ProfileConfig, ClientMode, StageId, LLMProto, Nationality, CommunicationProfile } from "./types.js";
 
 const HELP = `
@@ -45,6 +46,8 @@ required flags для headless setup (--name --age --stage --api-preset --api-ke
   --stage=<id>                met-irl-got-tg|tg-given-cold|tg-given-warming|convinced|first-date-done|dating-early|dating-stable|long-term
   --mcp=exa:KEY               можно несколько раз
   --list                      показать профили
+  --reauth=<slug>             перевыпустить Anthropic OAuth токены для профиля (только presetId=anthropic, authMethod=oauth)
+  --no-browser                для OAuth: не пытаться открыть браузер автоматически (печатает URL, ты открываешь сам)
   --help
 
 команды в работающем дашборде: :status :reset :stage <id> :pause :resume :cringe :persona :log :quit
@@ -55,9 +58,9 @@ async function main() {
     string: [
       "profile", "mode", "token", "api-id", "api-hash", "phone", "api-preset", "base-url", "proto", "model", "api-key",
       "name", "stage", "mcp", "nationality", "tz", "vibe", "persona-notes", "communication-preset",
-      "notifications", "message-style", "initiative", "life-sharing"
+      "notifications", "message-style", "initiative", "life-sharing", "reauth"
     ],
-    boolean: ["help", "list", "reset"],
+    boolean: ["help", "list", "reset", "no-browser"],
     alias: { h: "help" }
   });
 
@@ -74,6 +77,25 @@ async function main() {
   if (argv.list) {
     const list = await listProfiles();
     process.stdout.write(list.length ? list.join("\n") + "\n" : "(нет профилей)\n");
+    return;
+  }
+
+  if (argv.reauth) {
+    const slug = String(argv.reauth);
+    const cfg = await readConfig(slug);
+    if (!cfg) {
+      process.stderr.write(`profile not found: ${slug}\n`);
+      process.exit(1);
+    }
+    if (cfg.llm.presetId !== "anthropic" || cfg.llm.authMethod !== "oauth") {
+      process.stderr.write(`profile "${slug}": --reauth supported only for anthropic OAuth profiles (got presetId=${cfg.llm.presetId}, authMethod=${cfg.llm.authMethod ?? "api-key"})\n`);
+      process.exit(1);
+    }
+    const session = await runOAuthFlow({ noBrowser: argv["no-browser"] === true });
+    cfg.llm.oauth = session;
+    cfg.llm.authMethod = "oauth";
+    await writeConfig(cfg);
+    process.stdout.write(`OAuth tokens refreshed for "${slug}"\n`);
     return;
   }
 
@@ -102,7 +124,10 @@ async function main() {
     const cfg = await buildConfigFromFlags(argv);
     await writeConfig(cfg);
     process.stdout.write(`профиль: ${cfg.name}, ${cfg.age}, ${cfg.nationality}, ${cfg.tz}\nгенерируем persona.md / speech.md / communication.md...\n`);
-    const llm = makeLLM(cfg.llm);
+    const llm = makeLLM(cfg.llm, {
+      profile: cfg,
+      save: { kind: "capture", onCapture: (s) => { cfg.llm.oauth = s; } }
+    });
     const generated = await generatePersonaPack(llm, cfg.slug, cfg.name, cfg.age, cfg.nationality, personaNotesForGeneration(cfg));
     cfg.busySchedule = generated.busySchedule;
     await writeConfig(cfg);

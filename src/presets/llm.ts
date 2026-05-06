@@ -13,7 +13,8 @@ export const LLM_PRESETS: LLMPreset[] = [
     name: "Anthropic",
     proto: "anthropic",
     defaultModel: "claude-sonnet-4-6",
-    models: ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-opus-4-6", "claude-sonnet-4-5", "claude-opus-4-1"]
+    models: ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-opus-4-6", "claude-sonnet-4-5", "claude-opus-4-1"],
+    supportsOAuth: true
   },
   {
     id: "openrouter",

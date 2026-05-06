@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 — Anthropic OAuth (Claude Pro/Max)
+
+Дата: 2026-05-06
+
+- Добавлено: Claude.ai Pro/Max OAuth как альтернативный метод авторизации для пресета `anthropic`. В визарде новая радиокнопка между «API key» и «OAuth». Логин — paste-primary: открывается браузер на `claude.com/cai/oauth/authorize`, ты копируешь `code` (или весь redirect-URL) обратно в TUI.
+- Добавлены CLI-флаги: `--reauth=<slug>` (перевыпустить токены для существующего OAuth-профиля) и `--no-browser` (только распечатать URL, не пытаться запустить браузер).
+- Токены хранятся per-profile в `data/<slug>/config.json` (не в shared `~/.config/`). Refresh — гибридный: проактивный по `expiresAt` + lazy retry на 401. Single-flight через module-level Map в `src/llm/oauth.ts`.
+- Scope: только `user:inference` — минимум, нужный для `messages.create`. Меньше surface для AUP.
+- AUP caveat: Pro/Max OAuth — для личного использования. Прогон через бот, обслуживающий третьих лиц, может нарушать Anthropic AUP и привести к бану аккаунта. Визард показывает эту подсказку. Целевой кейс — owner-DM-only.
+- API-key путь не изменён. Существующие профили загружаются без миграции.
+
 ## 0.1.3 — Telegram formatting fix
 
 Дата: 2026-05-05

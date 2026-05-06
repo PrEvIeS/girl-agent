@@ -13,6 +13,15 @@ export interface LLMPreset {
   models?: string[];
   custom?: boolean;
   hint?: string;
+  supportsOAuth?: boolean;
+}
+
+export interface OAuthSession {
+  accessToken: string;
+  refreshToken: string;
+  /** ms since epoch */
+  expiresAt: number;
+  scope?: string;
 }
 
 export interface MCPPreset {
@@ -91,8 +100,13 @@ export interface ProfileConfig {
     presetId: string;
     proto: LLMProto;
     baseURL?: string;
-    apiKey: string;
+    /** Required when authMethod === "api-key" (default). Empty/omitted when authMethod === "oauth". */
+    apiKey?: string;
     model: string;
+    /** Defaults to "api-key" when undefined (back-compat with profiles created before 0.2.0). */
+    authMethod?: "api-key" | "oauth";
+    /** Present iff authMethod === "oauth". Persisted per-profile in data/<slug>/config.json. */
+    oauth?: OAuthSession;
   };
   telegram: {
     botToken?: string;
